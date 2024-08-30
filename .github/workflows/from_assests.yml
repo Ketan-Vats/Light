@@ -1,0 +1,212 @@
+name: Modify Framework and Services from assests
+
+on:
+  workflow_dispatch:
+    inputs:
+      android_api_level:
+        description: 'Android API level'
+        required: true
+        default: '34'
+      custom_device_name:
+        description: 'Device name '
+        required: true
+      custom_version:
+        description: 'Version code'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      actions: write
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '11'
+
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y default-jdk zipalign 7zip python3
+
+    - name: Copy framework.jar from assests
+      run: |
+        cp assests/framework.jar framework.jar
+
+    - name: Copy services.jar from assests
+      run: |
+        cp assests/services.jar services.jar
+
+    - name: Verify framework.jar
+      run: |
+        file framework.jar
+        hexdump -C framework.jar | head -n 10
+
+    - name: Verify services.jar
+      run: |
+        file services.jar
+        hexdump -C services.jar | head -n 10
+
+    - name: Clone smali repository
+      run: git clone --depth=1 https://github.com/JesusFreke/smali.git
+
+    - name: Build smali and baksmali
+      run: |
+        cd smali
+        ./gradlew build
+
+    - name: Extract framework.jar
+      run: 7z x framework.jar -oframework
+
+    - name: Extract services.jar
+      run: 7z x services.jar -oservices
+
+    - name: Decompile framework dex files
+      run: |
+        if [ -f framework.jar ]; then
+          if [ -f framework/classes.dex ]; then
+            java -jar smali/baksmali/build/libs/baksmali.jar d -a ${{ github.event.inputs.android_api_level }} framework/classes.dex -o classes
+          else
+            echo "framework/classes.dex not found, skipping..."
+          fi
+          for i in {2..6}; do
+            if [ -f framework/classes${i}.dex ]; then
+              java -jar smali/baksmali/build/libs/baksmali.jar d -a ${{ github.event.inputs.android_api_level }} framework/classes${i}.dex -o classes${i}
+            else
+              echo "framework/classes${i}.dex not found, skipping..."
+            fi
+          done
+        fi
+
+    - name: Decompile services dex files
+      run: |
+        java -jar smali/baksmali/build/libs/baksmali.jar d -a ${{ github.event.inputs.android_api_level }} services/classes.dex -o services_classes
+        java -jar smali/baksmali/build/libs/baksmali.jar d -a ${{ github.event.inputs.android_api_level }} services/classes2.dex -o services_classes2
+        java -jar smali/baksmali/build/libs/baksmali.jar d -a ${{ github.event.inputs.android_api_level }} services/classes3.dex -o services_classes3
+
+    - name: List decompiled files for debugging
+      run: |
+        if [ -f framework.jar ]; then
+            echo "Contents of classes directory:"
+            find classes
+            echo "Contents of classes2 directory:"
+            find classes2
+            echo "Contents of classes3 directory:"
+            find classes3
+        fi
+        find services_classes
+        echo "Contents of services_classes2 directory:"
+        find services_classes2
+        echo "Contents of services_classes3 directory:"
+        find services_classes3
+
+    - name: Backup smali files
+      run: |
+        if [ -f framework.jar ]; then
+            cp -r classes classes_backup
+            cp -r classes2 classes2_backup
+            cp -r classes3 classes3_backup
+        fi
+        cp -r services_classes services_classes_backup
+        cp -r services_classes2 services_classes2_backup
+        cp -r services_classes3 services_classes3_backup
+
+    - name: Modify framework smali files
+      run: |
+        if [ -f framework.jar ]; then
+            python3 framework_patch.py
+        fi
+
+    - name: Modify services smali files
+      run: |
+        python3 services_patch.py
+
+    - name: Recompile framework dex files
+      run: |
+        if [ -f framework.jar ]; then
+          if [ -d classes ]; then
+            java -jar smali/smali/build/libs/smali.jar a -a ${{ github.event.inputs.android_api_level }} classes -o framework/classes.dex
+          else
+            echo "classes directory not found, skipping classes.dex..."
+          fi
+          for i in {2..6}; do
+            if [ -d classes${i} ]; then
+              java -jar smali/smali/build/libs/smali.jar a -a ${{ github.event.inputs.android_api_level }} classes${i} -o framework/classes${i}.dex
+            else
+              echo "classes${i} directory not found, skipping classes${i}.dex..."
+            fi
+          done
+        fi
+
+    - name: Recompile services dex files
+      run: |
+        java -jar smali/smali/build/libs/smali.jar a -a ${{ github.event.inputs.android_api_level }} services_classes -o services/classes.dex
+        java -jar smali/smali/build/libs/smali.jar a -a ${{ github.event.inputs.android_api_level }} services_classes2 -o services/classes2.dex
+        java -jar smali/smali/build/libs/smali.jar a -a ${{ github.event.inputs.android_api_level }} services_classes3 -o services/classes3.dex
+
+    - name: Recompile framework.jar
+      run: |
+        if [ -f framework.jar ]; then
+            cd framework
+            7z a -tzip ../framework_new.zip *
+            cd ..
+        fi
+
+    - name: Recompile services.jar
+      run: |
+        cd services
+        7z a -tzip ../services_new.zip *
+        cd ..
+
+    - name: Align the zips
+      run: |
+        if [ -f framework.jar ]; then
+            zipalign -f -p -v -z 4 framework_new.zip aligned_framework.jar
+        fi
+        zipalign -f -p -v -z 4 services_new.zip aligned_services.jar
+
+    - name: Copy aligned jars to Magisk module
+      run: |
+        mkdir -p magisk_module/system/framework
+        [ -f framework.jar ] && cp aligned_framework.jar magisk_module/system/framework/framework.jar
+        cp aligned_services.jar magisk_module/system/framework/services.jar
+
+    - name: Create Version
+      run: |                
+        echo "version=${{ github.event.inputs.custom_version }}" >> $GITHUB_ENV       
+        echo "device_name=${{ github.event.inputs.custom_device_name }}" >> $GITHUB_ENV
+
+    - name: Zip Magisk module
+      run: |
+        cd magisk_module
+        zip -r ../moded_framework_services_${{ env.device_name }}_${{ env.version }}.zip *
+        cd ..
+        mkdir -p out
+        chmod +w moded_framework_services_${{ env.device_name }}_${{ env.version }}.zip
+        mv moded_framework_services_${{ env.device_name }}_${{ env.version }}.zip out/
+
+    - name: Create Release Notes
+      run: |
+        echo "## Release Notes" > release_notes.txt
+        echo "- Built modified jars from commit ${{ github.sha }}" >> release_notes.txt
+        echo "- Version: ${{ env.version }}" >> release_notes.txt
+        echo "- Device: ${{ env.device_name }}" >> release_notes.txt
+
+    - name: Create Release
+      uses: ncipollo/release-action@v1
+      with:
+        artifacts: out/*
+        tag: ${{ env.version }}
+        name: moded_${{ env.device_name }}_${{ env.version }}
+        allowUpdates: true
+        makeLatest: true
+        bodyFile: release_notes.txt
+        token: ${{ secrets.GITHUB_TOKEN }}
